@@ -138,6 +138,10 @@ __global__ void latent_u_matvec_k(const uint8_t* __restrict__ u_q8, const uint8_
     __syncthreads();
     const int c = c_shared;
     if (hout >= H) return;
+    // every routed row is the GPU's own (dst holds each of them once): there is no CPU row for U, so leave before
+    // the n_entries x c scan below, which would only skip the rows one by one (a window whose experts are all in
+    // VRAM; parts is not written either way, so the result is the same bits)
+    if (c >= n_entries) return;
     const uint8_t* wb = u_q8 + (size_t) g * (size_t) H * (size_t) wrow + (size_t) hout * (size_t) wrow;
     for (int r = 0; r < n_entries; ++r) {
         const int32_t e = ids[r];

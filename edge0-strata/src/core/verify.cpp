@@ -2187,6 +2187,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (const float* inv = strata::kernels::lat_gu_colscale_dev((int) l, (int) lat_ELL_))
                 strata::kernels::lat_colscale_rows(lat_xl_, (int64_t) T * (int64_t) lat_G_, (int) lat_ELL_, inv, cs);
             quantize_q8_1_rows(lat_xl_, T * lat_G_, (int) lat_ELL_, lat_xlq_, cs);
+            // AR-LATENT: the zero-doorbell graph has no CPU share and no host step per layer, so nobody reads the
+            // mapped act0 / xl rows or the xl doorbell: the four launches below are the doorbell graph's only
+            if (!ar_on()) {
             // DESIGN-4 + the write-path cut: quantize into a DEVICE buffer, then the copy engine
             // lands it in mapped host memory (async, off the compute stream's serial chain - the
             // same path the f32 rows take).  Bit-exact to the host's from_float (probe_std); the
@@ -2208,6 +2211,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (trace_m_ != nullptr) gpu_stamp(trace_m_, (l * kProfPer + 35) * 2, cs);   // K0-probe: D2H done
             doorbell_publish_value(nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr,
                                    (uint32_t*) m_xlseq_, (uint32_t) l + 1, cs);
+            }   // !ar_on()
         }
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
@@ -2416,6 +2420,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             int bn = br_n.fetch_add(1, std::memory_order_relaxed);
             if (bn < 12) std::fprintf(stderr, "BRANCH l=%lld grp=%d latent=%d ar_on=%d\n", (long long) l, (int) grp, (int) latent_, (int) ar_on());
         }
+        if (latent_ && ar_on()) {
+            // AR-LATENT: the latent layer of the zero-doorbell graph.  The plan is the device's (resident_plan in
+            // pre: every routed expert is in VRAM, counts = {groups, n*K, 0}), so there is no host plan to wait
+            // for, no PCIe share and no CPU share: A on the VRAM slots, then U for every routed row straight into
+            // parts_ (the doorbell graph computes the same rows into hit_out and moe_hit_set copies them over).
+            // The branch below waits on flags A / B / M per layer, which the host of this graph never raises
+            // (it raises the PLE flag once): that wait was the first-window stall of #200.
+            int32_t* p_tokw = const_cast<int32_t*>(p_tok);
+            latent_plan_rows(p_tokw, p_dst, p_counts, ids_ + (size_t) tb * K,
+                             lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, tb, lat_G_, (int) K, cs);
+            float* lat_yl_grp = lat_yl_ + (size_t) tb * K * (size_t) lat_ELL_;
+            const auto& LF = lay.fmt[(size_t) l];
+            const NativeExpertLayout La = native_expert_layout(LF.gu_type, LF.d_type, (int) lat_ELL_, (int) lat_I_);
+            stamp(l, 19, grp);
+            native_expert_grouped(La, p_ptr, p_start, p_counts, p_dst, p_tok, cap, cap, lat_xlq_, hit_scratch_,
+                                  lat_yl_grp, cs, 0);
+            stamp(l, 20, grp);
+            quantize_q8_1_rows(lat_yl_grp, cap, (int) lat_ELL_, lat_uq_, cs);
+            latent_u_grouped(lat_u_ + (size_t) l * lat_dense_.u_bytes(), (const uint8_t*) lat_uq_, ids_ + (size_t) tb * K,
+                             lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, cap, (int) lat_ELL_, (int) N,
+                             parts_out, cs, lat_fmt_);
+            hits_in_combine = false;
+        } else
         if (latent_) {
             static const bool u_gpu_mode = [] { const char* v = std::getenv("STRATA_LATENT_U_GPU"); return v != nullptr && std::atoi(v) != 0; }();
             if (device_plan_ && !u_gpu_mode) {   // the non-u_gpu tail ends in moe_hit_add_mapped's fused wait: no
@@ -3600,8 +3627,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
         // Layer 0's VRAM experts, and before raising *flag = 1), the NVMe PLE reads overlap with both
         // MtpDrafter::draft and Layer 0's attention + router + expert execution!
+        // PLE-ORDER: gather the window's PLE rows BEFORE layer 0's flag goes up, the order this loop had before the
+        // K0-fix below.  Layer 1's pre copies h_ple_ with no wait of its own in this (doorbell) graph: it relies on
+        // layer 0's wait for this flag, so with the flag raised first the copy can run while the rows are still the
+        // previous window's.  Measured on a GB10 (Edge0-145B NVFP4, 2026-11-20): with the flag first two runs of the
+        // same greedy requests differ (logits up to 4.4 apart); with the rows first they are bit-identical to each
+        // other and to the zero-doorbell graph (461 of 461 rows).  On by default; STRATA_PLE_BEFORE_FLAG=0 restores
+        // the K0-fix's order (its note: a blocked gather deadlocks the window's wait - not seen in these runs).
+        static const bool ple_before_flag = [] { const char* v = std::getenv("STRATA_PLE_BEFORE_FLAG"); return v == nullptr || v[0] != '0'; }();
+        if (ple_before_flag && k == 0 && do_ple) {
+            const Clock::time_point tp = Clock::now();
+            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata_store_fence();
+            ms_host += ms_since(tp);
+        }
         if (!(test_stall && k + 1 == steps)) *flag = want;   // K0-fix: publish hq-ready flag BEFORE the PLE gather (else a blocked gather deadlocks the window's wait_flag_ge)
-        if (k == 0 && do_ple) {
+        if (k == 0 && do_ple && !ple_before_flag) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
